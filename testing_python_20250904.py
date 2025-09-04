@@ -4,13 +4,14 @@ import sys
 import time
 import json
 from typing import Optional
+from typing import Dict, Any
 
 from logging.handlers import SysLogHandler
 import pyodbc
 from dotenv import load_dotenv
 
 
-def setup_syslog_logging(server='127.0.0.1', port=514):
+def setup_syslog_logging(server:str ='127.0.0.1', port:int=514):
     """設定 Syslog 處理器"""
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
@@ -34,122 +35,102 @@ class IbmiJournalMonitor:
         7: logging.DEBUG,    # Debug
     }
 
-    def __init__(self, host, user, password, driver, logger, journal_lib, journal_name, journal_types, interval):
-        # 在連線字串中加入 DefaultLibraries=QGPL 來穩定連線環境
-        # 加入 NAMING=1 (System Naming) 和 DefaultLibraries=QGPL 來穩定連線環境
-        self.conn_str = f"DRIVER={{{driver}}};SYSTEM={host};UID={user};PWD={password};DBQ=,QGPL;"
+    def __init__(self, host:str, user:str, password:str, driver:str, logger:logging.Logger, journal_lib:str, journal_name:str, journal_types:str, interval:int):
+        # Final Solution: Reverting to the simplest connection string from the successful testing.py.
+        # This avoids the SQL0443 error that occurs when NAMING=1 is combined with STARTING_* parameters in the UDF call.
+        self.conn_str = f"DRIVER={{{driver}}};SYSTEM={host};UID={user};PWD={password};"
         self.logger = logger
         self.interval = interval
         self.journal_lib = journal_lib
         self.journal_name = journal_name
         # 將逗號分隔的字串轉換為列表，並過濾掉空字串
         self.journal_types = [t.strip() for t in journal_types.split(',') if t.strip()]
-
-        # 狀態持久化設定
-        self.state_file = 'journal_monitor.state'
-        # 狀態管理：追蹤最後處理的日誌條目
+        
+        # State is now managed in memory and reset on each program start.
+        # This ensures the first query of every run is a full sync.
         self.last_receiver_name: Optional[str] = None
         self.last_sequence_number: Optional[int] = None
-        self._load_state()
-
-    def _load_state(self):
-        """從檔案載入上次處理的日誌位置。"""
-        try:
-            with open(self.state_file, 'r') as f:
-                state = json.load(f)
-                self.last_receiver_name = state.get('last_receiver_name')
-                self.last_sequence_number = state.get('last_sequence_number')
-                if self.last_receiver_name and self.last_sequence_number:
-                    self.logger.info(f"Loaded state, starting from: {self.last_receiver_name}/{self.last_sequence_number + 1}")
-        except FileNotFoundError:
-            self.logger.info("State file not found, starting from the beginning.")
-        except (json.JSONDecodeError, TypeError):
-            self.logger.exception("Error loading state file. Starting from the beginning.")
-
-    def _save_state(self):
-        """將當前處理的日誌位置儲存到檔案。"""
-        if not self.last_receiver_name or not self.last_sequence_number:
-            return # 沒有有效狀態可儲存
-        state = {
-            'last_receiver_name': self.last_receiver_name,
-            'last_sequence_number': self.last_sequence_number,
-        }
-        try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state, f)
-        except IOError:
-            self.logger.exception("Error saving state file:")
 
     def _process_one_batch(self):
         """連接、獲取一批新的日誌條目、處理它們並更新狀態。"""
-        conn = None
-        cursor = None
-
-        # --- 準備查詢 ---
-        journal_call_args = ["?, ?"]
-        params = [self.journal_lib, self.journal_name]
-
-        # 如果有已儲存的狀態，則加入起始點參數，從下一筆開始讀取
-        if self.last_receiver_name and self.last_sequence_number:
-            journal_call_args.extend(["STARTING_RECEIVER_NAME => ?", "STARTING_SEQUENCE => ?"])
-            params.extend([self.last_receiver_name, self.last_sequence_number + 1])
-
-        journal_call_args.append("GENERATE_SYSLOG => 'RFC5424'")
-        journal_call_str = ', '.join(journal_call_args)
-
-        sql = f"""
-            SELECT syslog_facility, syslog_severity, syslog_event, journal_entry_type,
-                   receiver_name, sequence_number
-            FROM TABLE (QSYS2.DISPLAY_JOURNAL({journal_call_str})) AS X
-        """
-
-        # 動態建立 WHERE 條件
-        where_clauses = ["syslog_event IS NOT NULL"]
-        if self.journal_types:
-            placeholders = ', '.join('?' for _ in self.journal_types)
-            where_clauses.append(f"journal_entry_type IN ({placeholders})")
-            params.extend(self.journal_types)
-
-        sql += " WHERE " + " AND ".join(where_clauses)
-
+        # 1. Attempt to connect to the database
         try:
-            conn = pyodbc.connect(self.conn_str, autocommit=True)
-            cursor = conn.cursor()
+            # Reverting to autocommit=False to match the behavior of the successful testing.py script.
+            conn = pyodbc.connect(self.conn_str)
+        except pyodbc.Error:
+            # Use logger.exception to automatically log stack traces for better debugging
+            self.logger.exception("Database connection failed. Check credentials, host, and driver.")
+            # If connection fails, we cannot proceed. Return and wait for the next cycle.
+            return
 
-            print("Checking for new journal entries...")
-            rows = list(cursor.execute(sql, params))
-            count = len(rows)
+        # 2. If connection is successful, prepare and execute the query
+        try:
+            # --- Final and Most Robust Solution: Filter in the WHERE clause ---
+            # All attempts to use STARTING_* parameters in the UDF call have proven unstable.
+            # The most reliable method is to fetch all entries from the UDF and apply filtering
+            # in a standard SQL WHERE clause, which is stable and well-supported.
+            journal_call_str = f"'{self.journal_lib}', '{self.journal_name}', GENERATE_SYSLOG => 'RFC5424'"
 
-            if count == 0:
-                print("No new journal entries found in this cycle.")
-                return
-
-            print(f"Found {count} new entries. Processing and sending to syslog...")
-
-            for row in rows:
-                syslog_event = row.SYSLOG_EVENT
-                syslog_severity = row.SYSLOG_SEVERITY
-                log_level = self.SEVERITY_MAP.get(syslog_severity, logging.INFO)
-                self.logger.log(log_level, syslog_event)
+            sql = f"""
+                SELECT syslog_facility, syslog_severity, syslog_event, journal_entry_type,
+                       receiver_name, sequence_number
+                FROM TABLE (QSYS2.DISPLAY_JOURNAL({journal_call_str})) AS X
+            """
             
-            # 處理完畢，從最後一筆記錄更新書籤狀態
-            last_row = rows[-1]
-            self.last_receiver_name = last_row.RECEIVER_NAME
-            # 將 Decimal 物件轉換為 int，以利 JSON 序列化
-            self.last_sequence_number = int(last_row.SEQUENCE_NUMBER)
-
-            print(f"Finished sending {count} entries. New bookmark: {self.last_receiver_name}/{self.last_sequence_number}")
-            self.logger.info(f"Processed {count} entries. New state: {self.last_receiver_name}/{self.last_sequence_number}")
+            params: list[Any] = []
+            where_clauses = ["syslog_event IS NOT NULL"]
             
-            # 儲存新的書籤狀態到檔案
-            self._save_state()
+            # Add filtering for the starting point directly in the WHERE clause
+            if self.last_receiver_name and self.last_sequence_number:
+                where_clauses.append("(receiver_name > ? OR (receiver_name = ? AND sequence_number > ?))")
+                params.extend([self.last_receiver_name, self.last_receiver_name, self.last_sequence_number])
 
-        except pyodbc.Error as e:
-            # 使用 logger.exception 可以自動記錄堆疊追蹤，更利於除錯
-            self.logger.exception("Database cycle failed:")
+            if self.journal_types:
+                placeholders = ', '.join('?' for _ in self.journal_types)
+                where_clauses.append(f"journal_entry_type IN ({placeholders})")
+                params.extend(self.journal_types)
+
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
+
+            sql += " ORDER BY receiver_name, sequence_number"
+
+            with conn.cursor() as cursor:
+                print("Checking for new journal entries...")
+                # 顯示將要執行的 SQL 語句和參數，以利除錯
+                print(f"Executing SQL: {sql}")
+                print(f"With parameters: {params}")
+                cursor.execute(sql, params)
+                
+                count = 0
+                last_row = None
+                # Iterate directly on the cursor to save memory, especially for large batches.
+                for row in cursor:
+                    if count == 0:
+                        print(f"Found new entries. Processing and sending to syslog...")
+                    
+                    syslog_event = row.SYSLOG_EVENT
+                    syslog_severity = row.SYSLOG_SEVERITY
+                    log_level = self.SEVERITY_MAP.get(syslog_severity, logging.INFO)
+                    self.logger.log(log_level, syslog_event)
+                    
+                    last_row = row # Keep track of the last processed row
+                    count += 1
+
+                if count == 0:
+                    print("No new journal entries found in this cycle.")
+                    return
+                
+                if last_row:
+                    self.last_receiver_name = last_row.RECEIVER_NAME
+                    self.last_sequence_number = int(last_row.SEQUENCE_NUMBER)
+                    print(f"Finished sending {count} entries. New bookmark: {self.last_receiver_name}/{self.last_sequence_number}")
+                    self.logger.info(f"Processed {count} entries. New state: {self.last_receiver_name}/{self.last_sequence_number}")
+
+        except pyodbc.Error:
+            self.logger.exception("Database query or processing failed. Check SQL syntax and permissions.")
         finally:
-            if cursor:
-                cursor.close()
+            # The connection will be closed here regardless of whether the query succeeded or failed.
             if conn:
                 conn.close()
 
@@ -196,8 +177,13 @@ if __name__ == "__main__":
         print(error_msg, file=sys.stderr)
         logger.critical(error_msg)
         sys.exit(1) # 結束程式並回傳錯誤碼
-
-    # 執行查詢並將日誌發送到 Syslog
-    monitor = IbmiJournalMonitor(ibmi_host, ibmi_user, ibmi_password, ibmi_driver, logger,
-                                 journal_lib, journal_name, journal_types, interval)
-    monitor.start()
+    else:
+        # Assert to the type checker that these values are not None.
+        assert ibmi_host is not None
+        assert ibmi_user is not None
+        assert ibmi_password is not None
+        assert ibmi_driver is not None
+        # 執行查詢並將日誌發送到 Syslog
+        monitor = IbmiJournalMonitor(ibmi_host, ibmi_user, ibmi_password, ibmi_driver, logger,
+                                     journal_lib, journal_name, journal_types, interval)
+        monitor.start()
