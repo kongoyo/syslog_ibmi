@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import threading
 from typing import Optional
 from typing import Dict, Any
 
@@ -38,6 +39,7 @@ class IbmiJournalMonitor:
     def __init__(self, host:str, user:str, password:str, driver:str, logger:logging.Logger, journal_lib:str, journal_name:str, journal_types:str, interval:int):
         # Final Solution: Reverting to the simplest connection string from the successful testing.py.
         # This avoids the SQL0443 error that occurs when NAMING=1 is combined with STARTING_* parameters in the UDF call.
+        self.host = host
         self.conn_str = f"DRIVER={{{driver}}};SYSTEM={host};UID={user};PWD={password};"
         self.logger = logger
         self.interval = interval
@@ -96,10 +98,10 @@ class IbmiJournalMonitor:
             sql += " ORDER BY receiver_name, sequence_number"
 
             with conn.cursor() as cursor:
-                print("Checking for new journal entries...")
+                print(f"[{self.host}] Checking for new journal entries...")
                 # 顯示將要執行的 SQL 語句和參數，以利除錯
-                print(f"Executing SQL: {sql}")
-                print(f"With parameters: {params}")
+                print(f"[{self.host}] Executing SQL: {sql}")
+                print(f"[{self.host}] With parameters: {params}")
                 cursor.execute(sql, params)
                 
                 count = 0
@@ -107,7 +109,7 @@ class IbmiJournalMonitor:
                 # Iterate directly on the cursor to save memory, especially for large batches.
                 for row in cursor:
                     if count == 0:
-                        print(f"Found new entries. Processing and sending to syslog...")
+                        print(f"[{self.host}] Found new entries. Processing and sending to syslog...")
                     
                     syslog_event = row.SYSLOG_EVENT
                     syslog_severity = row.SYSLOG_SEVERITY
@@ -118,14 +120,14 @@ class IbmiJournalMonitor:
                     count += 1
 
                 if count == 0:
-                    print("No new journal entries found in this cycle.")
+                    print(f"[{self.host}] No new journal entries found in this cycle.")
                     return
                 
                 if last_row:
                     self.last_receiver_name = last_row.RECEIVER_NAME
                     self.last_sequence_number = int(last_row.SEQUENCE_NUMBER)
-                    print(f"Finished sending {count} entries. New bookmark: {self.last_receiver_name}/{self.last_sequence_number}")
-                    self.logger.info(f"Processed {count} entries. New state: {self.last_receiver_name}/{self.last_sequence_number}")
+                    print(f"[{self.host}] Finished sending {count} entries. New bookmark: {self.last_receiver_name}/{self.last_sequence_number}")
+                    self.logger.info(f"[{self.host}] Processed {count} entries. New state: {self.last_receiver_name}/{self.last_sequence_number}")
 
         except pyodbc.Error:
             self.logger.exception("Database query or processing failed. Check SQL syntax and permissions.")
@@ -134,56 +136,75 @@ class IbmiJournalMonitor:
             if conn:
                 conn.close()
 
-    def start(self):
+    def start(self, shutdown_event: threading.Event):
         """啟動持續監控的迴圈。"""
-        print("Starting IBM i Journal Monitor. Press Ctrl+C to stop.")
-        self.logger.info("Daemon started.")
-        while True:
-            try:
-                self._process_one_batch()
-                print(f"Waiting for {self.interval} seconds before next check...")
-                time.sleep(self.interval)
-            except KeyboardInterrupt:
-                print("\nShutdown signal received. Exiting.")
-                self.logger.info("Daemon stopped by user.")
-                break
+        self.logger.info(f"[{self.host}] Monitor thread started.")
+        while not shutdown_event.is_set():
+            self._process_one_batch()
+            print(f"[{self.host}] Waiting for {self.interval} seconds before next check...")
+            # Use event.wait for a stoppable sleep
+            shutdown_event.wait(self.interval)
 
 if __name__ == "__main__":
     # 載入 .env 檔案中的環境變數
     load_dotenv()
 
-    # 從 .env 讀取 Syslog 伺服器 IP，並提供預設值
+    # --- 全域設定 ---
     syslog_server = os.getenv('SYSLOG_SERVER_IP', '127.0.0.1')
-
     logger = setup_syslog_logging(server=syslog_server)
     logger.info(f'Syslog handler configured for server: {syslog_server}')
-
-    # --- IBM i 連線範例 ---
-    # 程式會從 .env 檔案或系統環境變數中尋找 IBMI_USER 和 IBMI_PASSWORD
-    ibmi_host = os.getenv('IBMI_HOST')
-    ibmi_user = os.getenv('IBMI_USER')
-    ibmi_password = os.getenv('IBMI_PASSWORD')
-    ibmi_driver = os.getenv('IBMI_ODBC_DRIVER')
-    
-    # 讀取 Journal 相關設定，並提供預設值
-    journal_lib = os.getenv('IBMI_JOURNAL_LIBRARY', 'QSYS')
-    journal_name = os.getenv('IBMI_JOURNAL_NAME', 'QAUDJRN')
-    journal_types = os.getenv('IBMI_JOURNAL_TYPES', '') # 預設為空字串
     interval = int(os.getenv('POLLING_INTERVAL_SECONDS', 60))
 
-    # 檢查是否成功讀取到憑證
-    if not all([ibmi_host, ibmi_user, ibmi_password, ibmi_driver]):
-        error_msg = "錯誤：必須在 .env 檔案或環境變數中設定 IBMI_HOST, IBMI_USER, IBMI_PASSWORD 和 IBMI_ODBC_DRIVER。"
-        print(error_msg, file=sys.stderr)
-        logger.critical(error_msg)
-        sys.exit(1) # 結束程式並回傳錯誤碼
-    else:
-        # Assert to the type checker that these values are not None.
-        assert ibmi_host is not None
-        assert ibmi_user is not None
-        assert ibmi_password is not None
-        assert ibmi_driver is not None
-        # 執行查詢並將日誌發送到 Syslog
-        monitor = IbmiJournalMonitor(ibmi_host, ibmi_user, ibmi_password, ibmi_driver, logger,
+    # --- 讀取多主機設定並啟動監控執行緒 ---
+    monitors = []
+    threads = []
+    index = 1
+    while True:
+        host = os.getenv(f'IBMI_HOST_{index}')
+        if not host:
+            break # 找不到下一個主機設定，結束迴圈
+
+        user = os.getenv(f'IBMI_USER_{index}')
+        password = os.getenv(f'IBMI_PASSWORD_{index}')
+        driver = os.getenv(f'IBMI_DRIVER_{index}')
+        
+        if not all([user, password, driver]):
+            logger.error(f"Configuration for host {host} (IBMI_HOST_{index}) is incomplete. Skipping.")
+            index += 1
+            continue
+
+        journal_lib = os.getenv(f'IBMI_JOURNAL_LIBRARY_{index}', 'QSYS')
+        journal_name = os.getenv(f'IBMI_JOURNAL_NAME_{index}', 'QAUDJRN')
+        journal_types = os.getenv(f'IBMI_JOURNAL_TYPES_{index}', '')
+
+        print(f"Found configuration for host: {host}")
+        monitor = IbmiJournalMonitor(host, user, password, driver, logger,
                                      journal_lib, journal_name, journal_types, interval)
-        monitor.start()
+        monitors.append(monitor)
+        index += 1
+
+    if not monitors:
+        print("No host configurations found. Please check your .env file.", file=sys.stderr)
+        sys.exit(1)
+
+    shutdown_event = threading.Event()
+    print(f"Starting {len(monitors)} monitor(s). Press Ctrl+C to stop.")
+
+    for monitor in monitors:
+        thread = threading.Thread(target=monitor.start, args=(shutdown_event,))
+        thread.start()
+        threads.append(thread)
+
+    try:
+        # 主執行緒等待，直到所有監控執行緒結束
+        for thread in threads:
+            thread.join()
+    except KeyboardInterrupt:
+        print("\nShutdown signal received. Stopping all monitors...")
+        shutdown_event.set()
+        # 再次 join 以確保所有執行緒都已乾淨地退出
+        for thread in threads:
+            thread.join()
+
+    print("All monitors have been shut down. Exiting.")
+    logger.info("Daemon stopped.")
