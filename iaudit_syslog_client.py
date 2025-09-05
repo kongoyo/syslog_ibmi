@@ -142,29 +142,19 @@ class IbmiJournalMonitor:
             # Use event.wait for a stoppable sleep
             shutdown_event.wait(self.interval)
 
-if __name__ == "__main__":
-    # 載入 .env 檔案中的環境變數
-    load_dotenv()
-
-    # --- 全域設定 ---
-    syslog_server = os.getenv('SYSLOG_SERVER_IP', '127.0.0.1')
-    logger = setup_syslog_logging(server=syslog_server)
-    logger.info(f'Syslog handler configured for server: {syslog_server}')
-    interval = int(os.getenv('POLLING_INTERVAL_SECONDS', 60))
-
-    # --- 讀取多主機設定並啟動監控執行緒 ---
+def create_monitors_from_env(logger: logging.Logger, interval: int) -> list[IbmiJournalMonitor]:
+    """從環境變數讀取設定並建立 IbmiJournalMonitor 實例列表。"""
     monitors = []
-    threads = []
     index = 1
     while True:
         host = os.getenv(f'IBMI_HOST_{index}')
         if not host:
-            break # 找不到下一個主機設定，結束迴圈
+            break  # 找不到下一個主機設定，結束迴圈
 
         user = os.getenv(f'IBMI_USER_{index}')
         password = os.getenv(f'IBMI_PASSWORD_{index}')
         driver = os.getenv(f'IBMI_DRIVER_{index}')
-        
+
         if not all([user, password, driver]):
             logger.error(f"Configuration for host {host} (IBMI_HOST_{index}) is incomplete. Skipping.")
             index += 1
@@ -174,30 +164,49 @@ if __name__ == "__main__":
         journal_name = os.getenv(f'IBMI_JOURNAL_NAME_{index}', 'QAUDJRN')
         journal_types = os.getenv(f'IBMI_JOURNAL_TYPES_{index}', '')
 
-        print(f"Found configuration for host: {host}")
+        logger.info(f"Found configuration for host: {host}")
         monitor = IbmiJournalMonitor(host, user, password, driver, logger,
                                      journal_lib, journal_name, journal_types, interval)
         monitors.append(monitor)
         index += 1
+    return monitors
 
+def main():
+    """程式主進入點。"""
+    load_dotenv()
+
+    # --- 全域設定 ---
+    syslog_server = os.getenv('SYSLOG_SERVER_IP', '127.0.0.1')
+    logger = setup_syslog_logging(server=syslog_server)
+    logger.info(f'Syslog handler configured for server: {syslog_server}')
+    interval = int(os.getenv('POLLING_INTERVAL_SECONDS', 60))
+
+    # --- 建立監控器 ---
+    monitors = create_monitors_from_env(logger, interval)
     if not monitors:
         print("No host configurations found. Please check your .env file.", file=sys.stderr)
+        logger.error("No host configurations found. Exiting.")
         sys.exit(1)
 
+    # --- 啟動執行緒 ---
+    threads = []
     shutdown_event = threading.Event()
     print(f"Starting {len(monitors)} monitor(s). Press Ctrl+C to stop.")
+    logger.info(f"Starting {len(monitors)} monitor(s).")
 
     for monitor in monitors:
         thread = threading.Thread(target=monitor.start, args=(shutdown_event,))
         thread.start()
         threads.append(thread)
 
+    # --- 等待中斷信號以優雅地關閉 ---
     try:
         # 主執行緒等待，直到所有監控執行緒結束
         for thread in threads:
             thread.join()
     except KeyboardInterrupt:
         print("\nShutdown signal received. Stopping all monitors...")
+        logger.info("Shutdown signal received. Stopping all monitors...")
         shutdown_event.set()
         # 再次 join 以確保所有執行緒都已乾淨地退出
         for thread in threads:
@@ -205,3 +214,7 @@ if __name__ == "__main__":
 
     print("All monitors have been shut down. Exiting.")
     logger.info("Daemon stopped.")
+
+
+if __name__ == "__main__":
+    main()
