@@ -9,7 +9,7 @@ import pyodbc
 from dotenv import load_dotenv
 
 
-def setup_syslog_logging(server:str ='127.0.0.1', port:int=514):
+def setup_syslog_logging(server:str ='172.16.13.5', port:int=514):
     """設定 Syslog 處理器"""
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
